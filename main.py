@@ -78,5 +78,33 @@ def crop_document(req: CropRequest):
     M = cv2.getPerspectiveTransform(src, dst)
     warped = cv2.warpPerspective(img, M, (max_width, max_height))
 
-    # 5) "Scanner effect": wit papier & scherpe tekst
-    #    -> converteer naar grijs, beetje blur, dan adaptive thresho
+    # 5) Mild "scanner effect": witter papier + iets scherper, maar geen harde zwart/wit
+    #    -> LAB equalize voor papier, daarna lichte sharpen + brightness/contrast
+    lab = cv2.cvtColor(warped, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+
+    # equalize L-kanaal (lichtheid) voor witter papier
+    l = cv2.equalizeHist(l)
+
+    lab = cv2.merge((l, a, b))
+    enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+    # lichte sharpening
+    kernel = np.array([[0, -1, 0],
+                       [-1, 5, -1],
+                       [0, -1, 0]])
+    enhanced = cv2.filter2D(enhanced, -1, kernel)
+
+    # kleine boost in helderheid/contrast
+    enhanced = cv2.convertScaleAbs(enhanced, alpha=1.1, beta=10)
+
+    # 6) Encode naar JPEG en terug naar base64 voor de app
+    success, buf = cv2.imencode(
+        ".jpg", enhanced, [int(cv2.IMWRITE_JPEG_QUALITY), 90]
+    )
+    if not success:
+        return {"base64": None}
+
+    out_b64 = base64.b64encode(buf).decode("utf-8")
+    return {"base64": out_b64}
+
