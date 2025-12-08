@@ -41,7 +41,7 @@ def crop_document(req: CropRequest):
     h, w = img.shape[:2]
     c = req.corners
 
-    # 2) Source points (in pixels) from normalized corners (0–1)
+    # 2) Source points (in pixels) from normalized corners
     src = np.array(
         [
             [c.tl.x * w, c.tl.y * h],
@@ -52,6 +52,55 @@ def crop_document(req: CropRequest):
         dtype="float32",
     )
 
-    # 3) Bepaal outputgrootte (rechthoek)
-    widt
+    # 3) Compute output size (straight rectangle)
+    width_top = _distance(src[0], src[1])
+    width_bottom = _distance(src[3], src[2])
+    height_left = _distance(src[0], src[3])
+    height_right = _distance(src[1], src[2])
 
+    max_width = int(max(width_top, width_bottom))
+    max_height = int(max(height_left, height_right))
+
+    max_width = max(100, max_width)
+    max_height = max(100, max_height)
+
+    dst = np.array(
+        [
+            [0, 0],
+            [max_width - 1, 0],
+            [max_width - 1, max_height - 1],
+            [0, max_height - 1],
+        ],
+        dtype="float32",
+    )
+
+    # 4) Perspective transform (maakt de pagina recht / plat)
+    M = cv2.getPerspectiveTransform(src, dst)
+    warped = cv2.warpPerspective(img, M, (max_width, max_height))
+
+    # 5) "Scanner effect": wit papier & scherpe tekst
+    #    -> converteer naar grijs, beetje blur, dan adaptive threshold
+    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    enhanced = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        35,
+        10,
+    )
+
+    # terug naar 3-kanaals zodat alles consistent blijft
+    enhanced = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+
+    # 6) Encode naar JPEG en terug naar base64 voor de app
+    success, buf = cv2.imencode(
+        ".jpg", enhanced, [int(cv2.IMWRITE_JPEG_QUALITY), 90]
+    )
+    if not success:
+        return {"base64": None}
+
+    out_b64 = base64.b64encode(buf).decode("utf-8")
+    return {"base64": out_b64}
