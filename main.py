@@ -7,11 +7,16 @@ import numpy as np
 app = FastAPI()
 
 
+class Point(BaseModel):
+    x: float
+    y: float
+
+
 class Corners(BaseModel):
-    tl: dict
-    tr: dict
-    br: dict
-    bl: dict
+    tl: Point
+    tr: Point
+    br: Point
+    bl: Point
 
 
 class CropRequest(BaseModel):
@@ -19,11 +24,16 @@ class CropRequest(BaseModel):
     corners: Corners
 
 
+def _distance(a, b):
+    return np.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
+
+
 @app.post("/api/document/crop")
 def crop_document(req: CropRequest):
+    # 1) Decode base64 image
     img_data = base64.b64decode(req.imageBase64)
-    nparr = np.frombuffer(img_data, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    np_arr = np.frombuffer(img_data, np.uint8)
+    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
     if img is None:
         return {"base64": None}
@@ -31,26 +41,28 @@ def crop_document(req: CropRequest):
     h, w = img.shape[:2]
     c = req.corners
 
+    # 2) Source points (in pixels) from normalized corners
     src = np.array(
         [
-            [c.tl["x"] * w, c.tl["y"] * h],
-            [c.tr["x"] * w, c.tr["y"] * h],
-            [c.br["x"] * w, c.br["y"] * h],
-            [c.bl["x"] * w, c.bl["y"] * h],
+            [c.tl.x * w, c.tl.y * h],
+            [c.tr.x * w, c.tr.y * h],
+            [c.br.x * w, c.br.y * h],
+            [c.bl.x * w, c.bl.y * h],
         ],
         dtype="float32",
     )
 
-    width_top = np.linalg.norm(src[0] - src[1])
-    width_bottom = np.linalg.norm(src[3] - src[2])
-    max_width = int(max(width_top, width_bottom))
+    # 3) Compute output size (straight rectangle)
+    width_top = _distance(src[0], src[1])
+    width_bottom = _distance(src[3], src[2])
+    height_left = _distance(src[0], src[3])
+    height_right = _distance(src[1], src[2])
 
-    height_left = np.linalg.norm(src[0] - src[3])
-    height_right = np.linalg.norm(src[1] - src[2])
+    max_width = int(max(width_top, width_bottom))
     max_height = int(max(height_left, height_right))
 
-    if max_width < 10 or max_height < 10:
-        return {"base64": None}
+    max_width = max(100, max_width)
+    max_height = max(100, max_height)
 
     dst = np.array(
         [
@@ -62,12 +74,9 @@ def crop_document(req: CropRequest):
         dtype="float32",
     )
 
+    # 4) Perspective transform (maakt de pagina recht / plat)
     M = cv2.getPerspectiveTransform(src, dst)
     warped = cv2.warpPerspective(img, M, (max_width, max_height))
 
-    ok, buf = cv2.imencode(".jpg", warped, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-    if not ok:
-        return {"base64": None}
-
-    b64 = base64.b64encode(buf.tobytes()).decode("utf-8")
-    return {"base64": b64}
+    # 5) "Scanner effect": wit papier & scherpe tekst
+    #    -> converteer naar grijs, beetje blur, dan adaptive thresho
