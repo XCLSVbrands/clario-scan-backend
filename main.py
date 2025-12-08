@@ -41,7 +41,7 @@ def crop_document(req: CropRequest):
     h, w = img.shape[:2]
     c = req.corners
 
-    # 2) Source points (in pixels) from normalized corners
+    # 2) Source points (in pixels) from normalized corners (0–1)
     src = np.array(
         [
             [c.tl.x * w, c.tl.y * h],
@@ -52,26 +52,6 @@ def crop_document(req: CropRequest):
         dtype="float32",
     )
 
-    # 3) Compute output size (straight rectangle)
-    width_top = _distance(src[0], src[1])
-    width_bottom = _distance(src[3], src[2])
-    height_left = _distance(src[0], src[3])
-    height_right = _distance(src[1], src[2])
+    # 3) Bepaal outputgrootte (rechthoek)
+    widt
 
-    max_width = int(max(width_top, width_bottom))
-    max_height = int(max(height_left, height_right))
-
-    max_width = max(100, max_width)
-    max_height = max(100, max_height)
-
-    dst = np.array(
-        [
-            [0, 0],
-            [max_width - 1, 0],
-            [max_width - 1, max_height - 1],
-            [0, max_height - 1],
-        ],
-        dtype="float32",
-    )
-
-    # 4) Perspective transform (maakt de pagina recht
