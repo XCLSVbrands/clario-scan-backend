@@ -78,29 +78,31 @@ def crop_document(req: CropRequest):
     M = cv2.getPerspectiveTransform(src, dst)
     warped = cv2.warpPerspective(img, M, (max_width, max_height))
 
-    # 5) "Scanner effect": wit papier & scherpe tekst
-    #    -> converteer naar grijs, beetje blur, dan adaptive threshold
+    # 5) Document-scan effect: ruis weg + zwart/wit + witte achtergrond
+    #    -> grijs, denoise, dan adaptive threshold
     gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
-    enhanced = cv2.adaptiveThreshold(
+    # lichte ruisonderdrukking (helpt tegen korreligheid)
+    gray = cv2.fastNlMeansDenoising(gray, None, h=15, templateWindowSize=7, searchWindowSize=21)
+
+    # kleine blur voor stabielere threshold
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # adaptive threshold: maakt papier wit en tekst donker
+    bw = cv2.adaptiveThreshold(
         gray,
         255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
-        35,
-        10,
+        31,   # blokgrootte (moet oneven zijn)
+        10,   # offset, kan je later tunen als nodig
     )
-
-    # terug naar 3-kanaals zodat alles consistent blijft
-    enhanced = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
 
     # 6) Encode naar JPEG en terug naar base64 voor de app
-    success, buf = cv2.imencode(
-        ".jpg", enhanced, [int(cv2.IMWRITE_JPEG_QUALITY), 90]
-    )
+    success, buf = cv2.imencode(".jpg", bw, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
     if not success:
         return {"base64": None}
 
     out_b64 = base64.b64encode(buf).decode("utf-8")
     return {"base64": out_b64}
+
