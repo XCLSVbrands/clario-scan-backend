@@ -7,7 +7,7 @@ import numpy as np
 app = FastAPI()
 
 
-# --------- MODELS ---------
+# ---------- Models ----------
 
 class Point(BaseModel):
     x: float
@@ -26,66 +26,107 @@ class CropRequest(BaseModel):
     corners: Corners
 
 
-class DetectRequest(BaseModel):
-    imageBase64: str
-
-
-# --------- HELPERS ---------
-
-def _distance(a, b):
-    return np.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
-
+# ---------- Helpers ----------
 
 def _order_points(pts: np.ndarray) -> np.ndarray:
-    # pts shape (4, 2)
+    """
+    Sorteer 4 punten: tl, tr, br, bl
+    """
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
-    diff = np.diff(pts, axis=1)
+    rect[0] = pts[np.argmin(s)]  # top-left
+    rect[2] = pts[np.argmax(s)]  # bottom-right
 
-    rect[0] = pts[np.argmin(s)]      # tl: kleinste x+y
-    rect[2] = pts[np.argmax(s)]      # br: grootste x+y
-    rect[1] = pts[np.argmin(diff)]   # tr: kleinste (x-y)
-    rect[3] = pts[np.argmax(diff)]   # bl: grootste (x-y)
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]  # top-right
+    rect[3] = pts[np.argmax(diff)]  # bottom-left
     return rect
 
 
-# --------- DOC CROP + SCAN EFFECT ---------
+def _find_document_corners(img: np.ndarray) -> np.ndarray | None:
+    """
+    Probeer automatisch de grootste 4-hoek (document) te vinden.
+    Retourneert 4 punten in (x, y) of None.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    edges = cv2.Canny(gray, 60, 150)
+    edges = cv2.dilate(edges, None, iterations=2)
+    edges = cv2.erode(edges, None, iterations=1)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
+
+    for cnt in contours:
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+
+        # 4 hoekpunten = kandidaat document
+        if len(approx) == 4:
+            pts = approx.reshape(4, 2).astype("float32")
+            return _order_points(pts)
+
+    return None
+
+
+# ---------- Endpoint ----------
 
 @app.post("/api/document/crop")
 def crop_document(req: CropRequest):
-    # 1) Decode base64
-    img_data = base64.b64decode(req.imageBase64)
-    np_arr = np.frombuffer(img_data, np.uint8)
+    """
+    1) Decode base64 → OpenCV image
+    2) Probeer document automatisch te vinden (4-hoek)
+       - als dat lukt, gebruiken we die corners
+       - anders gebruiken we de corners uit de app
+    3) Pas perspectief-correctie toe
+    4) Maak "scanner" versie (meer contrast / witter papier)
+    5) Encode terug naar base64 JPEG
+    """
+    # ---- 1. Decode ----
+    try:
+        img_bytes = base64.b64decode(req.imageBase64)
+    except Exception:
+        return {"base64": None}
+
+    np_arr = np.frombuffer(img_bytes, np.uint8)
     img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
     if img is None:
         return {"base64": None}
 
     h, w = img.shape[:2]
-    c = req.corners
 
-    # 2) Source points in pixels
-    src = np.array(
-        [
-            [c.tl.x * w, c.tl.y * h],
-            [c.tr.x * w, c.tr.y * h],
-            [c.br.x * w, c.br.y * h],
-            [c.bl.x * w, c.bl.y * h],
-        ],
-        dtype="float32",
-    )
+    # ---- 2. Auto-detect corners ----
+    auto_corners = _find_document_corners(img)
 
-    # 3) Doel-afmeting
-    width_top = _distance(src[0], src[1])
-    width_bottom = _distance(src[3], src[2])
-    height_left = _distance(src[0], src[3])
-    height_right = _distance(src[1], src[2])
+    if auto_corners is not None:
+        src = auto_corners
+    else:
+        # fallback: gebruik corners van de gebruiker
+        c = req.corners
+        src = np.array(
+            [
+                [c.tl.x * w, c.tl.y * h],
+                [c.tr.x * w, c.tr.y * h],
+                [c.br.x * w, c.br.y * h],
+                [c.bl.x * w, c.bl.y * h],
+            ],
+            dtype="float32",
+        )
+        src = _order_points(src)
+
+    # ---- 3. Perspectief-correctie ----
+    width_top = np.linalg.norm(src[0] - src[1])
+    width_bottom = np.linalg.norm(src[3] - src[2])
+    height_left = np.linalg.norm(src[0] - src[3])
+    height_right = np.linalg.norm(src[1] - src[2])
 
     max_width = int(max(width_top, width_bottom))
     max_height = int(max(height_left, height_right))
 
-    max_width = max(100, max_width)
-    max_height = max(100, max_height)
+    max_width = max(400, max_width)
+    max_height = max(400, max_height)
 
     dst = np.array(
         [
@@ -97,87 +138,41 @@ def crop_document(req: CropRequest):
         dtype="float32",
     )
 
-    # 4) Perspectief-correctie
     M = cv2.getPerspectiveTransform(src, dst)
     warped = cv2.warpPerspective(img, M, (max_width, max_height))
 
-    # 5) "Scanner look" maar niet keihard zwart/wit
+    # ---- 4. "Scanner" effect ----
+    # We houden het bij grijs + contrast verbetering.
     gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
 
-    # lichte denoise
-    gray = cv2.fastNlMeansDenoising(gray, None, h=10, templateWindowSize=7, searchWindowSize=21)
+    # zachte denoising tegen korrel
+    gray = cv2.fastNlMeansDenoising(
+        gray, None, h=10, templateWindowSize=7, searchWindowSize=21
+    )
 
-    # contrast verbeteren met CLAHE
+    # lokale contrastverhoging
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     gray = clahe.apply(gray)
 
-    # unsharp mask (scherpere letters)
-    blur = cv2.GaussianBlur(gray, (0, 0), sigmaX=1.0)
-    sharp = cv2.addWeighted(gray, 1.5, blur, -0.5, 0)
+    # lichte adaptive threshold (niet zo extreem als eerst)
+    bw = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,  # blokgrootte
+        5,   # offset, lager = minder hard contrast
+    )
 
-    # terug naar 3-kanalen zodat het “normaal” oogt
-    final = cv2.cvtColor(sharp, cv2.COLOR_GRAY2BGR)
+    # terug naar 3-kanaals beeld
+    out = cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
 
-    # 6) Encode naar JPEG
-    success, buf = cv2.imencode(".jpg", final, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-    if not success:
+    # ---- 5. Encode naar base64 ----
+    ok, buf = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    if not ok:
         return {"base64": None}
 
     out_b64 = base64.b64encode(buf).decode("utf-8")
     return {"base64": out_b64}
 
-
-# --------- AUTO CORNER DETECTION ---------
-
-@app.post("/api/document/detect_corners")
-def detect_corners(req: DetectRequest):
-    img_data = base64.b64decode(req.imageBase64)
-    np_arr = np.frombuffer(img_data, np.uint8)
-    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-
-    if img is None:
-        return {"corners": None}
-
-    h, w = img.shape[:2]
-
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    edges = cv2.Canny(gray, 50, 150)
-
-    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-
-    doc_cnt = None
-    max_area = 0
-
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < 0.1 * w * h:  # te klein, skip
-            continue
-
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-
-        if len(approx) == 4 and area > max_area:
-            doc_cnt = approx
-            max_area = area
-
-    if doc_cnt is None:
-        # fallback: hele beeld
-        tl = {"x": 0.05, "y": 0.05}
-        tr = {"x": 0.95, "y": 0.05}
-        br = {"x": 0.95, "y": 0.95}
-        bl = {"x": 0.05, "y": 0.95}
-    else:
-        pts = doc_cnt.reshape(4, 2).astype("float32")
-        ordered = _order_points(pts)
-
-        tl_pt, tr_pt, br_pt, bl_pt = ordered
-
-        tl = {"x": float(tl_pt[0] / w), "y": float(tl_pt[1] / h)}
-        tr = {"x": float(tr_pt[0] / w), "y": float(tr_pt[1] / h)}
-        br = {"x": float(br_pt[0] / w), "y": float(br_pt[1] / h)}
-        bl = {"x": float(bl_pt[0] / w), "y": float(bl_pt[1] / h)}
-
-    return {"corners": {"tl": tl, "tr": tr, "br": br, "bl": bl}}
 
