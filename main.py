@@ -7,8 +7,6 @@ import numpy as np
 app = FastAPI()
 
 
-# ---------- MODELS ----------
-
 class Point(BaseModel):
     x: float
     y: float
@@ -26,98 +24,13 @@ class CropRequest(BaseModel):
     corners: Corners
 
 
-class DetectRequest(BaseModel):
-    imageBase64: str
-
-
-# ---------- HELPERS ----------
-
 def _distance(a, b):
     return np.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
 
 
-def _order_points(pts):
-    # pts: (4,2)
-    rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
-    diff = np.diff(pts, axis=1)
-
-    rect[0] = pts[np.argmin(s)]      # tl
-    rect[2] = pts[np.argmax(s)]      # br
-    rect[1] = pts[np.argmin(diff)]   # tr
-    rect[3] = pts[np.argmax(diff)]   # bl
-    return rect
-
-
-# ---------- DETECT ENDPOINT ----------
-
-@app.post("/api/document/detect")
-def detect_document(req: DetectRequest):
-  try:
-      img_data = base64.b64decode(req.imageBase64)
-      np_arr = np.frombuffer(img_data, np.uint8)
-      img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-  except Exception:
-      return {"corners": None}
-
-  if img is None:
-      return {"corners": None}
-
-  h, w = img.shape[:2]
-
-  # verklein voor snelheid, maar onthoud schaal
-  scale = 600.0 / max(h, w)
-  if scale < 1.0:
-      img_small = cv2.resize(img, (int(w * scale), int(h * scale)))
-  else:
-      img_small = img.copy()
-      scale = 1.0
-
-  gray = cv2.cvtColor(img_small, cv2.COLOR_BGR2GRAY)
-  gray = cv2.GaussianBlur(gray, (5, 5), 0)
-
-  # Canny + contours
-  edged = cv2.Canny(gray, 50, 150)
-  contours, _ = cv2.findContours(edged, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-
-  if not contours:
-      return {"corners": None}
-
-  contours = sorted(contours, key=cv2.contourArea, reverse=True)
-
-  doc_cnt = None
-  for c in contours:
-      peri = cv2.arcLength(c, True)
-      approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-      if len(approx) == 4:
-          doc_cnt = approx
-          break
-
-  if doc_cnt is None:
-      return {"corners": None}
-
-  pts = doc_cnt.reshape(4, 2).astype("float32")
-
-  # schaal terug naar originele resolutie
-  pts /= scale
-
-  rect = _order_points(pts)  # tl, tr, br, bl
-
-  (tl, tr, br, bl) = rect
-  # normaliseer naar 0–1
-  tl_n = {"x": float(tl[0] / w), "y": float(tl[1] / h)}
-  tr_n = {"x": float(tr[0] / w), "y": float(tr[1] / h)}
-  br_n = {"x": float(br[0] / w), "y": float(br[1] / h)}
-  bl_n = {"x": float(bl[0] / w), "y": float(bl[1] / h)}
-
-  return {"corners": {"tl": tl_n, "tr": tr_n, "br": br_n, "bl": bl_n}}
-
-
-# ---------- CROP ENDPOINT ----------
-
 @app.post("/api/document/crop")
 def crop_document(req: CropRequest):
-    # 1) Decode base64 image
+    # 1) Decode base64 naar een BGR-beeld
     img_data = base64.b64decode(req.imageBase64)
     np_arr = np.frombuffer(img_data, np.uint8)
     img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
@@ -128,7 +41,7 @@ def crop_document(req: CropRequest):
     h, w = img.shape[:2]
     c = req.corners
 
-    # 2) Source points (in pixels) from normalized corners
+    # 2) Source-punten (pixels) uit genormaliseerde hoeken
     src = np.array(
         [
             [c.tl.x * w, c.tl.y * h],
@@ -139,7 +52,7 @@ def crop_document(req: CropRequest):
         dtype="float32",
     )
 
-    # 3) Compute output size (straight rectangle)
+    # 3) Doel-rechthoek (uitgangsformaat)
     width_top = _distance(src[0], src[1])
     width_bottom = _distance(src[3], src[2])
     height_left = _distance(src[0], src[3])
@@ -148,8 +61,8 @@ def crop_document(req: CropRequest):
     max_width = int(max(width_top, width_bottom))
     max_height = int(max(height_left, height_right))
 
-    max_width = max(100, max_width)
-    max_height = max(100, max_height)
+    max_width = max(200, max_width)
+    max_height = max(200, max_height)
 
     dst = np.array(
         [
@@ -161,34 +74,30 @@ def crop_document(req: CropRequest):
         dtype="float32",
     )
 
-    # 4) Perspective transform (document recht maken)
+    # 4) Perspective-correctie (document recht trekken)
     M = cv2.getPerspectiveTransform(src, dst)
     warped = cv2.warpPerspective(img, M, (max_width, max_height))
 
-    # 5) "Scanner effect" in kleur:
-    #    - lichte denoise
-    #    - lokale contrastverbetering (CLAHE op L-kanaal)
-    denoised = cv2.fastNlMeansDenoisingColored(
-        warped, None, 5, 5, 7, 21
-    )
-
-    lab = cv2.cvtColor(denoised, cv2.COLOR_BGR2LAB)
+    # 5) Lichte verbetering: kleur en contrast, maar geen harde threshold
+    #    a) LAB + CLAHE op L-kanaal (lokale contrastverbetering)
+    lab = cv2.cvtColor(warped, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l2 = clahe.apply(l)
+    cl = clahe.apply(l)
+    limg = cv2.merge((cl, a, b))
+    enhanced = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
 
-    lab2 = cv2.merge((l2, a, b))
-    enhanced = cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
+    #    b) milde ruisreductie (beter dan sterke blur)
+    enhanced = cv2.bilateralFilter(enhanced, d=5, sigmaColor=25, sigmaSpace=25)
 
-    # optioneel: klein beetje verscherpen
-    kernel = np.array([[0, -1, 0],
-                       [-1, 5, -1],
-                       [0, -1, 0]], dtype="float32")
-    sharpened = cv2.filter2D(enhanced, -1, kernel)
+    #    c) lichte sharpen (unsharp mask)
+    blur = cv2.GaussianBlur(enhanced, (0, 0), 1.0)
+    sharp = cv2.addWeighted(enhanced, 1.2, blur, -0.2, 0)
 
-    # 6) Encode naar JPEG en terug als base64
-    success, buf = cv2.imencode(".jpg", sharpened, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    # 6) Encode naar JPEG met redelijke kwaliteit
+    success, buf = cv2.imencode(
+        ".jpg", sharp, [int(cv2.IMWRITE_JPEG_QUALITY), 95]
+    )
     if not success:
         return {"base64": None}
 
