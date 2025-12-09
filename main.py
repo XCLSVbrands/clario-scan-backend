@@ -7,7 +7,7 @@ import numpy as np
 app = FastAPI()
 
 
-# ---------- Models ----------
+# ---------- Pydantic modellen ----------
 
 class Point(BaseModel):
     x: float
@@ -26,43 +26,62 @@ class CropRequest(BaseModel):
     corners: Corners
 
 
-class DetectRequest(BaseModel):
+class AutoCornersRequest(BaseModel):
     imageBase64: str
 
 
-# ---------- Helpers ----------
+# ---------- Hulpfuncties ----------
 
 def _distance(a, b):
-    return float(np.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2))
+    return np.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
 
 
 def _order_points(pts):
-    """
-    Neem 4 punten (x, y) en orden ze als tl, tr, br, bl.
-    """
+    """Sorteer 4 punten naar (tl, tr, br, bl)."""
     rect = np.zeros((4, 2), dtype="float32")
-
     s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]  # tl
-    rect[2] = pts[np.argmax(s)]  # br
-
     diff = np.diff(pts, axis=1)
+
+    rect[0] = pts[np.argmin(s)]     # tl
+    rect[2] = pts[np.argmax(s)]     # br
     rect[1] = pts[np.argmin(diff)]  # tr
     rect[3] = pts[np.argmax(diff)]  # bl
-
     return rect
 
 
-# ---------- /api/document/crop ----------
+def _enhance_document_color(img):
+    """
+    Kleur-document verbeteren:
+    - lichte ruisreductie
+    - contrast verbeteren met CLAHE
+    - subtiel verscherpen
+    """
+    # klein beetje denoise om korrel te verminderen
+    denoised = cv2.fastNlMeansDenoisingColored(
+        img, None, h=5, hColor=5, templateWindowSize=7, searchWindowSize=21
+    )
+
+    # CLAHE op L-kanaal (LAB) voor beter contrast, maar behoud kleur
+    lab = cv2.cvtColor(denoised, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    cl = clahe.apply(l)
+    lab_enhanced = cv2.merge((cl, a, b))
+    enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
+
+    # lichte unsharp-mask voor scherpere tekst
+    gaussian = cv2.GaussianBlur(enhanced, (0, 0), 1.0)
+    sharp = cv2.addWeighted(enhanced, 1.5, gaussian, -0.5, 0)
+
+    return sharp
+
+
+# ---------- ENDPOINT: perspectief-crop + kleur-scan ----------
 
 @app.post("/api/document/crop")
 def crop_document(req: CropRequest):
     # 1) Decode base64 image
-    try:
-        img_data = base64.b64decode(req.imageBase64)
-    except Exception:
-        return {"base64": None}
-
+    img_data = base64.b64decode(req.imageBase64)
     np_arr = np.frombuffer(img_data, np.uint8)
     img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
@@ -72,7 +91,7 @@ def crop_document(req: CropRequest):
     h, w = img.shape[:2]
     c = req.corners
 
-    # 2) Source points (pixels from normalized corners)
+    # 2) Source points (in pixels) from normalized corners
     src = np.array(
         [
             [c.tl.x * w, c.tl.y * h],
@@ -83,7 +102,7 @@ def crop_document(req: CropRequest):
         dtype="float32",
     )
 
-    # 3) Output size (straight rectangle)
+    # 3) Output size bepalen
     width_top = _distance(src[0], src[1])
     width_bottom = _distance(src[3], src[2])
     height_left = _distance(src[0], src[3])
@@ -92,8 +111,8 @@ def crop_document(req: CropRequest):
     max_width = int(max(width_top, width_bottom))
     max_height = int(max(height_left, height_right))
 
-    max_width = max(300, max_width)
-    max_height = max(400, max_height)
+    max_width = max(200, max_width)
+    max_height = max(200, max_height)
 
     dst = np.array(
         [
@@ -105,32 +124,15 @@ def crop_document(req: CropRequest):
         dtype="float32",
     )
 
-    # 4) Perspective transform: maak de pagina recht
+    # 4) Perspective transform (rechte, platte pagina)
     M = cv2.getPerspectiveTransform(src, dst)
     warped = cv2.warpPerspective(img, M, (max_width, max_height))
 
-    # ---------- "Scanner" effect ----------
-    # 5) Grijs + local contrast (CLAHE) + lichte sharpening
-    gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+    # 5) Document visueel verbeteren in kleur
+    enhanced = _enhance_document_color(warped)
 
-    # Adaptive contrast
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
-
-    # Light denoise
-    enhanced = cv2.fastNlMeansDenoising(enhanced, None, h=8, templateWindowSize=7, searchWindowSize=21)
-
-    # Mild sharpening
-    kernel = np.array([[0, -1, 0],
-                       [-1, 5, -1],
-                       [0, -1, 0]], dtype="float32")
-    sharp = cv2.filter2D(enhanced, -1, kernel)
-
-    # Maak er 3-kanalen beeld van voor nette JPEG
-    out = cv2.cvtColor(sharp, cv2.COLOR_GRAY2BGR)
-
-    # 6) Encode to JPEG -> base64
-    success, buf = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    # 6) Encode naar JPEG en base64 teruggeven
+    success, buf = cv2.imencode(".jpg", enhanced, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
     if not success:
         return {"base64": None}
 
@@ -138,61 +140,88 @@ def crop_document(req: CropRequest):
     return {"base64": out_b64}
 
 
-# ---------- /api/document/detect ----------
+# ---------- ENDPOINT: auto-detect document corners ----------
 
-@app.post("/api/document/detect")
-def detect_document(req: DetectRequest):
-    """
-    Vind document-contour en geef corners terug als normalized coords (0..1).
-    """
-    try:
-        img_data = base64.b64decode(req.imageBase64)
-    except Exception:
-        return {"corners": None}
-
+@app.post("/api/document/autocorners")
+def auto_detect_corners(req: AutoCornersRequest):
+    img_data = base64.b64decode(req.imageBase64)
     np_arr = np.frombuffer(img_data, np.uint8)
     img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
     if img is None:
         return {"corners": None}
 
-    h, w = img.shape[:2]
+    orig_h, orig_w = img.shape[:2]
 
-    # 1) Preprocessing
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # verklein voor snelheid, maar onthoud schaal
+    max_side = max(orig_w, orig_h)
+    scale = 800.0 / max_side if max_side > 800 else 1.0
+    resized = cv2.resize(
+        img,
+        (int(orig_w * scale), int(orig_h * scale)),
+        interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR,
+    )
+
+    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    # 2) Edges + contours
     edges = cv2.Canny(gray, 50, 150)
-    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    # iets dikker maken zodat contouren beter sluiten
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    edges = cv2.dilate(edges, kernel, iterations=1)
 
-    if not contours:
-        return {"corners": None}
+    contours, _ = cv2.findContours(
+        edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
+    )
 
-    # 3) Pak grootste 4-hoek
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    best_quad = None
+    best_area = 0
+    img_area = resized.shape[0] * resized.shape[1]
 
-    doc_cnt = None
     for cnt in contours:
         peri = cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-        if len(approx) == 4:
-            doc_cnt = approx
-            break
 
-    if doc_cnt is None:
-        return {"corners": None}
+        if len(approx) != 4:
+            continue
 
-    pts = doc_cnt.reshape(4, 2).astype("float32")
+        area = cv2.contourArea(approx)
+        # alleen grote vierhoeken (minstens 20% van beeld)
+        if area < 0.2 * img_area:
+            continue
+
+        if area > best_area:
+            best_area = area
+            best_quad = approx
+
+    if best_quad is None:
+        # fallback: hele beeld als rechthoek (net als eerder)
+        corners = {
+            "tl": {"x": 0.05, "y": 0.05},
+            "tr": {"x": 0.95, "y": 0.05},
+            "br": {"x": 0.95, "y": 0.95},
+            "bl": {"x": 0.05, "y": 0.95},
+        }
+        return {"corners": corners}
+
+    # terugschalen naar originele resolutie
+    pts = best_quad.reshape(4, 2).astype("float32")
+    pts /= scale
+
     ordered = _order_points(pts)
 
-    # 4) Normaliseer naar 0..1
     tl, tr, br, bl = ordered
     corners = {
-        "tl": {"x": float(tl[0] / w), "y": float(tl[1] / h)},
-        "tr": {"x": float(tr[0] / w), "y": float(tr[1] / h)},
-        "br": {"x": float(br[0] / w), "y": float(br[1] / h)},
-        "bl": {"x": float(bl[0] / w), "y": float(bl[1] / h)},
+        "tl": {"x": float(tl[0] / orig_w), "y": float(tl[1] / orig_h)},
+        "tr": {"x": float(tr[0] / orig_w), "y": float(tr[1] / orig_h)},
+        "br": {"x": float(br[0] / orig_w), "y": float(br[1] / orig_h)},
+        "bl": {"x": float(bl[0] / orig_w), "y": float(bl[1] / orig_h)},
     }
 
     return {"corners": corners}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
