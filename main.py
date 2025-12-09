@@ -95,6 +95,8 @@ def detect_document_corners(image: np.ndarray):
     Zoek het grootste 'document'-vlak (4-hoek).
     Retourneert 4 punten (tl, tr, br, bl) of None.
     """
+    h, w = image.shape[:2]
+
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
     edged = cv2.Canny(gray, 50, 150)
@@ -109,10 +111,36 @@ def detect_document_corners(image: np.ndarray):
         approx = cv2.approxPolyDP(c, 0.02 * peri, True)
 
         if len(approx) == 4:
+            area = cv2.contourArea(approx)
+            area_ratio = area / float(w * h)
+
+            # als bijna hele beeld → niet betrouwbaar, liever fallback
+            if area_ratio > 0.9:
+                return None
+
             pts = approx.reshape(4, 2).astype("float32")
             return order_points(pts)
 
     return None
+
+
+def center_fallback_corners(w: int, h: int) -> np.ndarray:
+    """
+    Geef een mooi gecentreerd kader (ongeveer 12%–88%),
+    vergelijkbaar met je oude default in de app.
+    """
+    pad_x = 0.06 * w
+    pad_y = 0.06 * h
+
+    return np.array(
+        [
+            [pad_x, pad_y],
+            [w - pad_x, pad_y],
+            [w - pad_x, h - pad_y],
+            [pad_x, h - pad_y],
+        ],
+        dtype="float32",
+    )
 
 
 def enhance_document(image: np.ndarray) -> np.ndarray:
@@ -164,13 +192,9 @@ async def detect(file: UploadFile = File(...)):
     corners = detect_document_corners(image)
 
     if corners is None:
-        # fallback: hele afbeelding
-        corners = np.array(
-            [[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]],
-            dtype="float32",
-        )
+        # fallback: mooi gecentreerd vlak (in plaats van hele foto)
+        corners = center_fallback_corners(w, h)
 
-    # corners is ge-ordered: tl, tr, br, bl
     tl, tr, br, bl = corners
 
     return {
@@ -232,3 +256,4 @@ async def crop(
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
