@@ -9,6 +9,7 @@ import cv2
 from io import BytesIO
 from PIL import Image
 import base64
+import pillow_heif
 
 app = FastAPI()
 
@@ -16,9 +17,31 @@ app = FastAPI()
 # ----------------- Helpers -----------------
 
 
+def read_image_bytes(content: bytes) -> np.ndarray:
+    """
+    Probeer eerst 'normale' JPEG/PNG via OpenCV.
+    Als dat faalt (bijv. HEIC), gebruik pillow-heif.
+    """
+    np_img = np.frombuffer(content, np.uint8)
+    img = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
+    if img is not None:
+        return img
+
+    # HEIC fallback
+    heif_file = pillow_heif.read_heif(content)
+    pil_img = Image.frombytes(
+        heif_file.mode,
+        heif_file.size,
+        heif_file.data,
+        "raw",
+    )
+    img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    return img
+
+
 def order_points(pts: np.ndarray) -> np.ndarray:
     """
-    Sorteer 4 punten naar volgorde:
+    Sorteer 4 punten naar:
     top-left, top-right, bottom-right, bottom-left
     """
     rect = np.zeros((4, 2), dtype="float32")
@@ -69,8 +92,8 @@ def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
 
 def detect_document_corners(image: np.ndarray):
     """
-    Zoek het grootste 'document'-achtige vlak (4-hoek).
-    Retourneert 4 punten of None.
+    Zoek het grootste 'document'-vlak (4-hoek).
+    Retourneert 4 punten (tl, tr, br, bl) of None.
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -92,9 +115,21 @@ def detect_document_corners(image: np.ndarray):
     return None
 
 
+def enhance_document(image: np.ndarray) -> np.ndarray:
+    """
+    Maak tekst duidelijker zonder hard zwart/wit:
+    - CLAHE op grijsbeeld
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced_gray = clahe.apply(gray)
+    enhanced = cv2.cvtColor(enhanced_gray, cv2.COLOR_GRAY2BGR)
+    return enhanced
+
+
 def encode_image_to_base64(image: np.ndarray, quality: int = 95) -> str:
     """
-    Converteer een OpenCV image (BGR of grayscale) naar JPEG base64 string.
+    Converteer een OpenCV image naar JPEG base64 string.
     """
     if len(image.shape) == 2:
         pil_img = Image.fromarray(image)
@@ -117,8 +152,7 @@ async def detect(file: UploadFile = File(...)):
     3) Stuurt width, height en corners.{topLeft, topRight, bottomRight, bottomLeft} terug.
     """
     content = await file.read()
-    np_img = np.frombuffer(content, np.uint8)
-    image = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
+    image = read_image_bytes(content)
 
     if image is None:
         return JSONResponse(
@@ -135,6 +169,7 @@ async def detect(file: UploadFile = File(...)):
             [[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]],
             dtype="float32",
         )
+
     # corners is ge-ordered: tl, tr, br, bl
     tl, tr, br, bl = corners
 
@@ -163,13 +198,13 @@ async def crop(
     bottomLeftY: float = Form(...),
 ):
     """
-    1) Ontvangt de originele foto + definitieve hoeken (pixels).
+    1) Ontvangt originele foto + definitieve hoeken (pixels).
     2) Doet perspectief-correctie.
-    3) Stuurt een scherpe JPEG (zonder harde zwart-wit threshold) als base64.
+    3) Verbetert leesbaarheid licht met CLAHE.
+    4) Stuurt scherpe JPEG als base64 terug.
     """
     content = await file.read()
-    np_img = np.frombuffer(content, np.uint8)
-    image = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
+    image = read_image_bytes(content)
 
     if image is None:
         return JSONResponse(
@@ -188,13 +223,12 @@ async def crop(
     )
 
     warped = four_point_transform(image, pts)
+    enhanced = enhance_document(warped)
 
-    # Geen threshold; alleen lichte JPEG-compressie
-    image_base64 = encode_image_to_base64(warped, quality=95)
+    image_base64 = encode_image_to_base64(enhanced, quality=95)
 
     return {"image_base64": image_base64}
 
 
 if __name__ == "__main__":
-    # Lokaal testen; op Railway wordt PORT via env gezet
     uvicorn.run(app, host="0.0.0.0", port=8000)
