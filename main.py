@@ -1,173 +1,200 @@
 # main.py
 
-from fastapi import FastAPI
-from pydantic import BaseModel
-import base64
-import cv2
+from fastapi import FastAPI, File, UploadFile, Form
+from fastapi.responses import JSONResponse
+import uvicorn
+
 import numpy as np
+import cv2
+from io import BytesIO
+from PIL import Image
+import base64
 
 app = FastAPI()
 
 
-# ---------- Models ----------
-
-class Point(BaseModel):
-    x: float  # genormaliseerd 0..1
-    y: float
+# ----------------- Helpers -----------------
 
 
-class Corners(BaseModel):
-    tl: Point
-    tr: Point
-    br: Point
-    bl: Point
-
-
-class CropRequest(BaseModel):
-    imageBase64: str
-    corners: Corners
-
-
-# ---------- Helpers ----------
-
-def _distance(a, b):
-    return np.sqrt((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2)
-
-
-def _unsharp_mask(bgr, amount=1.0, radius=3, threshold=0):
+def order_points(pts: np.ndarray) -> np.ndarray:
     """
-    Simpele unsharp mask in kleur.
-    amount   = hoeveel scherpte (0.5–1.5 is normaal)
-    radius   = blur kernel (3 of 5)
-    threshold= niet gebruiken (laten op 0)
+    Sorteer 4 punten naar volgorde:
+    top-left, top-right, bottom-right, bottom-left
     """
-    blurred = cv2.GaussianBlur(bgr, (radius * 2 + 1, radius * 2 + 1), 0)
-    # versterk verschil tussen origineel en blur
-    sharpened = cv2.addWeighted(bgr, 1 + amount, blurred, -amount, 0)
+    rect = np.zeros((4, 2), dtype="float32")
 
-    # clip naar geldige range
-    sharpened = np.clip(sharpened, 0, 255).astype(np.uint8)
-    return sharpened
+    s = pts.sum(axis=1)
+    diff = np.diff(pts, axis=1)
+
+    rect[0] = pts[np.argmin(s)]      # top-left
+    rect[2] = pts[np.argmax(s)]      # bottom-right
+    rect[1] = pts[np.argmin(diff)]   # top-right
+    rect[3] = pts[np.argmax(diff)]   # bottom-left
+
+    return rect
 
 
-def _enhance_document_color(bgr):
+def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
     """
-    Houdt het document in kleur, maakt achtergrond witter
-    en tekst wat duidelijker, zonder harde zwart/wit threshold.
+    Perspectief-correctie op basis van 4 punten.
     """
+    rect = order_points(pts)
+    (tl, tr, br, bl) = rect
 
-    # 1) lichte ruisonderdrukking in kleur
-    #    h=5 is mild. Als het nog te "vlekkerig" is, verlaag naar 3.
-    denoised = cv2.fastNlMeansDenoisingColored(
-        bgr, None,
-        h=5,         # luminantie ruis
-        hColor=5,    # kleur ruis
-        templateWindowSize=7,
-        searchWindowSize=21,
-    )
+    # breedtes
+    widthA = np.linalg.norm(br - bl)
+    widthB = np.linalg.norm(tr - tl)
+    maxWidth = int(max(widthA, widthB))
 
-    # 2) Werk in LAB-kleurruimte: L = lichtheid,
-    #    daarop doen we lokale contrastverbetering (CLAHE)
-    lab = cv2.cvtColor(denoised, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-
-    # CLAHE = adaptieve contrast-herverdeling
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l2 = clahe.apply(l)
-
-    lab2 = cv2.merge((l2, a, b))
-    enhanced = cv2.cvtColor(lab2, cv2.COLOR_LAB2BGR)
-
-    # 3) milde sharpening voor tekst
-    sharpened = _unsharp_mask(enhanced, amount=0.8, radius=2)
-
-    return sharpened
-
-
-# ---------- Routes ----------
-
-@app.get("/")
-def health():
-    return {"status": "ok"}
-
-
-@app.post("/api/document/crop")
-def crop_document(req: CropRequest):
-    # 1) Decode base64 image
-    try:
-        img_data = base64.b64decode(req.imageBase64)
-    except Exception:
-        return {"base64": None}
-
-    np_arr = np.frombuffer(img_data, np.uint8)
-    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-
-    if img is None:
-        return {"base64": None}
-
-    h, w = img.shape[:2]
-    c = req.corners
-
-    # 2) Source points (in pixels) van genormaliseerde hoeken
-    src = np.array(
-        [
-            [c.tl.x * w, c.tl.y * h],
-            [c.tr.x * w, c.tr.y * h],
-            [c.br.x * w, c.br.y * h],
-            [c.bl.x * w, c.bl.y * h],
-        ],
-        dtype="float32",
-    )
-
-    # 3) Bepaal rechte doel-rect
-    width_top = _distance(src[0], src[1])
-    width_bottom = _distance(src[3], src[2])
-    height_left = _distance(src[0], src[3])
-    height_right = _distance(src[1], src[2])
-
-    max_width = int(max(width_top, width_bottom))
-    max_height = int(max(height_left, height_right))
-
-    # minimale grootte voor veiligheid
-    max_width = max(300, max_width)
-    max_height = max(400, max_height)
+    # hoogtes
+    heightA = np.linalg.norm(tr - br)
+    heightB = np.linalg.norm(tl - bl)
+    maxHeight = int(max(heightA, heightB))
 
     dst = np.array(
         [
             [0, 0],
-            [max_width - 1, 0],
-            [max_width - 1, max_height - 1],
-            [0, max_height - 1],
+            [maxWidth - 1, 0],
+            [maxWidth - 1, maxHeight - 1],
+            [0, maxHeight - 1],
         ],
         dtype="float32",
     )
 
-    # 4) Perspectief-correctie (document recht trekken)
-    M = cv2.getPerspectiveTransform(src, dst)
-    warped = cv2.warpPerspective(img, M, (max_width, max_height))
+    M = cv2.getPerspectiveTransform(rect, dst)
+    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
 
-    # 5) Document-verbetering in kleur
-    doc_color = _enhance_document_color(warped)
+    return warped
 
-    # 6) Eventueel verkleinen voor filesize (optioneel)
-    #    Max breedte 1600px
-    max_side = 1600
-    h_doc, w_doc = doc_color.shape[:2]
-    scale = min(1.0, float(max_side) / max(w_doc, h_doc))
-    if scale < 1.0:
-        new_w = int(w_doc * scale)
-        new_h = int(h_doc * scale)
-        doc_color = cv2.resize(doc_color, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-    # 7) Encode naar JPEG en terug naar base64
-    success, buf = cv2.imencode(
-        ".jpg",
-        doc_color,
-        [int(cv2.IMWRITE_JPEG_QUALITY), 90],
+def detect_document_corners(image: np.ndarray):
+    """
+    Zoek het grootste 'document'-achtige vlak (4-hoek).
+    Retourneert 4 punten of None.
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edged = cv2.Canny(gray, 50, 150)
+
+    contours, _ = cv2.findContours(
+        edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
+    )
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
+
+    for c in contours:
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+
+        if len(approx) == 4:
+            pts = approx.reshape(4, 2).astype("float32")
+            return order_points(pts)
+
+    return None
+
+
+def encode_image_to_base64(image: np.ndarray, quality: int = 95) -> str:
+    """
+    Converteer een OpenCV image (BGR of grayscale) naar JPEG base64 string.
+    """
+    if len(image.shape) == 2:
+        pil_img = Image.fromarray(image)
+    else:
+        pil_img = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+
+    buf = BytesIO()
+    pil_img.save(buf, format="JPEG", quality=quality)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+# ----------------- Endpoints -----------------
+
+
+@app.post("/detect")
+async def detect(file: UploadFile = File(...)):
+    """
+    1) Ontvangt de originele foto.
+    2) Detecteert document-hoeken.
+    3) Stuurt width, height en corners.{topLeft, topRight, bottomRight, bottomLeft} terug.
+    """
+    content = await file.read()
+    np_img = np.frombuffer(content, np.uint8)
+    image = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
+
+    if image is None:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Could not decode image"},
+        )
+
+    h, w = image.shape[:2]
+    corners = detect_document_corners(image)
+
+    if corners is None:
+        # fallback: hele afbeelding
+        corners = np.array(
+            [[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]],
+            dtype="float32",
+        )
+    # corners is ge-ordered: tl, tr, br, bl
+    tl, tr, br, bl = corners
+
+    return {
+        "width": w,
+        "height": h,
+        "corners": {
+            "topLeft": {"x": float(tl[0]), "y": float(tl[1])},
+            "topRight": {"x": float(tr[0]), "y": float(tr[1])},
+            "bottomRight": {"x": float(br[0]), "y": float(br[1])},
+            "bottomLeft": {"x": float(bl[0]), "y": float(bl[1])},
+        },
+    }
+
+
+@app.post("/crop")
+async def crop(
+    file: UploadFile = File(...),
+    topLeftX: float = Form(...),
+    topLeftY: float = Form(...),
+    topRightX: float = Form(...),
+    topRightY: float = Form(...),
+    bottomRightX: float = Form(...),
+    bottomRightY: float = Form(...),
+    bottomLeftX: float = Form(...),
+    bottomLeftY: float = Form(...),
+):
+    """
+    1) Ontvangt de originele foto + definitieve hoeken (pixels).
+    2) Doet perspectief-correctie.
+    3) Stuurt een scherpe JPEG (zonder harde zwart-wit threshold) als base64.
+    """
+    content = await file.read()
+    np_img = np.frombuffer(content, np.uint8)
+    image = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
+
+    if image is None:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Could not decode image"},
+        )
+
+    pts = np.array(
+        [
+            [topLeftX, topLeftY],
+            [topRightX, topRightY],
+            [bottomRightX, bottomRightY],
+            [bottomLeftX, bottomLeftY],
+        ],
+        dtype="float32",
     )
 
-    if not success:
-        return {"base64": None}
+    warped = four_point_transform(image, pts)
 
-    out_b64 = base64.b64encode(buf).decode("utf-8")
-    return {"base64": out_b64}
+    # Geen threshold; alleen lichte JPEG-compressie
+    image_base64 = encode_image_to_base64(warped, quality=95)
+
+    return {"image_base64": image_base64}
+
+
+if __name__ == "__main__":
+    # Lokaal testen; op Railway wordt PORT via env gezet
+    uvicorn.run(app, host="0.0.0.0", port=8000)
