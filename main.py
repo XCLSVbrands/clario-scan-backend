@@ -1,3 +1,4 @@
+
 from fastapi import FastAPI
 from pydantic import BaseModel
 import base64
@@ -56,12 +57,10 @@ def _enhance_document_color(img):
     - contrast verbeteren met CLAHE
     - subtiel verscherpen
     """
-    # klein beetje denoise om korrel te verminderen
     denoised = cv2.fastNlMeansDenoisingColored(
         img, None, h=5, hColor=5, templateWindowSize=7, searchWindowSize=21
     )
 
-    # CLAHE op L-kanaal (LAB) voor beter contrast, maar behoud kleur
     lab = cv2.cvtColor(denoised, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -69,7 +68,6 @@ def _enhance_document_color(img):
     lab_enhanced = cv2.merge((cl, a, b))
     enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
 
-    # lichte unsharp-mask voor scherpere tekst
     gaussian = cv2.GaussianBlur(enhanced, (0, 0), 1.0)
     sharp = cv2.addWeighted(enhanced, 1.5, gaussian, -0.5, 0)
 
@@ -153,22 +151,31 @@ def auto_detect_corners(req: AutoCornersRequest):
 
     orig_h, orig_w = img.shape[:2]
 
-    # verklein voor snelheid, maar onthoud schaal
+    # 1) verklein voor snelheid
     max_side = max(orig_w, orig_h)
-    scale = 800.0 / max_side if max_side > 800 else 1.0
+    scale = 900.0 / max_side if max_side > 900 else 1.0
     resized = cv2.resize(
         img,
         (int(orig_w * scale), int(orig_h * scale)),
         interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR,
     )
 
+    # 2) grijs + blur
     gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    edges = cv2.Canny(gray, 50, 150)
-    # iets dikker maken zodat contouren beter sluiten
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    edges = cv2.dilate(edges, kernel, iterations=1)
+    # 3) adaptive threshold om papier duidelijk te maken
+    thr = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        11, 2
+    )
+
+    # 4) randen + dichtmaken
+    edges = cv2.Canny(thr, 50, 150)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    edges = cv2.dilate(edges, kernel, iterations=2)
 
     contours, _ = cv2.findContours(
         edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
@@ -186,8 +193,10 @@ def auto_detect_corners(req: AutoCornersRequest):
             continue
 
         area = cv2.contourArea(approx)
-        # alleen grote vierhoeken (minstens 20% van beeld)
-        if area < 0.2 * img_area:
+        area_ratio = area / float(img_area)
+
+        # alleen grote vierhoeken (tussen 25% en 90% van het beeld)
+        if area_ratio < 0.25 or area_ratio > 0.9:
             continue
 
         if area > best_area:
@@ -195,12 +204,12 @@ def auto_detect_corners(req: AutoCornersRequest):
             best_quad = approx
 
     if best_quad is None:
-        # fallback: hele beeld als rechthoek (net als eerder)
+        # fallback: groot kader in het midden
         corners = {
-            "tl": {"x": 0.05, "y": 0.05},
-            "tr": {"x": 0.95, "y": 0.05},
-            "br": {"x": 0.95, "y": 0.95},
-            "bl": {"x": 0.05, "y": 0.95},
+            "tl": {"x": 0.08, "y": 0.08},
+            "tr": {"x": 0.92, "y": 0.08},
+            "br": {"x": 0.92, "y": 0.92},
+            "bl": {"x": 0.08, "y": 0.92},
         }
         return {"corners": corners}
 
