@@ -1,4 +1,3 @@
-
 from fastapi import FastAPI
 from pydantic import BaseModel
 import base64
@@ -50,31 +49,50 @@ def _order_points(pts):
     return rect
 
 
-def _enhance_document_color(img):
+def _shrink_quad(pts, factor=0.02):
     """
-    Kleur-document verbeteren:
-    - lichte ruisreductie
-    - contrast verbeteren met CLAHE
-    - subtiel verscherpen
+    Trek de vierhoek een klein beetje naar binnen
+    zodat de crop strakker rond het document ligt.
+    factor = 0.02 betekent ~2% naar binnen.
     """
-    denoised = cv2.fastNlMeansDenoisingColored(
-        img, None, h=5, hColor=5, templateWindowSize=7, searchWindowSize=21
+    if pts.shape != (4, 2):
+        return pts
+
+    cx = np.mean(pts[:, 0])
+    cy = np.mean(pts[:, 1])
+    centered = pts - np.array([[cx, cy]])
+    shrunk = centered * (1.0 - factor) + np.array([[cx, cy]])
+    return shrunk
+
+
+def _enhance_document_bw(img):
+    """
+    Maak van een foto een 'echte scan':
+    - grijs
+    - Otsu threshold -> bijna wit papier, donkere tekst
+    - kleine ruis weg
+    Retourneert een BGR-image zodat we als kleur-JPEG kunnen encoden.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # lichte blur tegen ruis
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    # automatische drempel (zwart/wit)
+    _, thresh = cv2.threshold(
+        gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
     )
 
-    lab = cv2.cvtColor(denoised, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    cl = clahe.apply(l)
-    lab_enhanced = cv2.merge((cl, a, b))
-    enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
+    # kleine vlekjes weghalen
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
 
-    gaussian = cv2.GaussianBlur(enhanced, (0, 0), 1.0)
-    sharp = cv2.addWeighted(enhanced, 1.5, gaussian, -0.5, 0)
-
-    return sharp
+    # terug naar BGR zodat JPEG het snapt
+    bw_bgr = cv2.cvtColor(cleaned, cv2.COLOR_GRAY2BGR)
+    return bw_bgr
 
 
-# ---------- ENDPOINT: perspectief-crop + kleur-scan ----------
+# ---------- ENDPOINT: perspectief-crop + scan-look ----------
 
 @app.post("/api/document/crop")
 def crop_document(req: CropRequest):
@@ -100,6 +118,9 @@ def crop_document(req: CropRequest):
         dtype="float32",
     )
 
+    # trek de vierhoek een klein beetje naar binnen
+    src = _shrink_quad(src, factor=0.02)
+
     # 3) Output size bepalen
     width_top = _distance(src[0], src[1])
     width_bottom = _distance(src[3], src[2])
@@ -109,8 +130,8 @@ def crop_document(req: CropRequest):
     max_width = int(max(width_top, width_bottom))
     max_height = int(max(height_left, height_right))
 
-    max_width = max(200, max_width)
-    max_height = max(200, max_height)
+    max_width = max(300, max_width)
+    max_height = max(300, max_height)
 
     dst = np.array(
         [
@@ -126,11 +147,11 @@ def crop_document(req: CropRequest):
     M = cv2.getPerspectiveTransform(src, dst)
     warped = cv2.warpPerspective(img, M, (max_width, max_height))
 
-    # 5) Document visueel verbeteren in kleur
-    enhanced = _enhance_document_color(warped)
+    # 5) Document omzetten naar zwart/wit scan
+    enhanced = _enhance_document_bw(warped)
 
     # 6) Encode naar JPEG en base64 teruggeven
-    success, buf = cv2.imencode(".jpg", enhanced, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    success, buf = cv2.imencode(".jpg", enhanced, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
     if not success:
         return {"base64": None}
 
@@ -153,7 +174,7 @@ def auto_detect_corners(req: AutoCornersRequest):
 
     # 1) verklein voor snelheid
     max_side = max(orig_w, orig_h)
-    scale = 900.0 / max_side if max_side > 900 else 1.0
+    scale = 1000.0 / max_side if max_side > 1000 else 1.0
     resized = cv2.resize(
         img,
         (int(orig_w * scale), int(orig_h * scale)),
@@ -187,7 +208,7 @@ def auto_detect_corners(req: AutoCornersRequest):
 
     for cnt in contours:
         peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        approx = cv2.approxPolyDP(cnt, 0.015 * peri, True)  # iets strakker
 
         if len(approx) != 4:
             continue
@@ -233,4 +254,4 @@ def auto_detect_corners(req: AutoCornersRequest):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port="8000")
