@@ -166,8 +166,9 @@ def auto_detect_corners(req: AutoCornersRequest):
 
     orig_h, orig_w = img.shape[:2]
 
+    # iets grotere resize voor meer detail
     max_side = max(orig_w, orig_h)
-    scale = 1000.0 / max_side if max_side > 1000 else 1.0
+    scale = 1200.0 / max_side if max_side > 1200 else 1.0
     resized = cv2.resize(
         img,
         (int(orig_w * scale), int(orig_h * scale)),
@@ -198,7 +199,7 @@ def auto_detect_corners(req: AutoCornersRequest):
 
     for cnt in contours:
         peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.015 * peri, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)  # iets losser
 
         if len(approx) != 4:
             continue
@@ -206,7 +207,10 @@ def auto_detect_corners(req: AutoCornersRequest):
         area = cv2.contourArea(approx)
         area_ratio = area / float(img_area)
 
-        if area_ratio < 0.25 or area_ratio > 0.9:
+        # *Alleen* heel kleine of echt 100% volle vormen weggooien
+        if area_ratio < 0.15:   # kleiner dan ~15% van beeld = ruis
+            continue
+        if area_ratio > 0.995:  # bijna exact volledige frame = geen papier
             continue
 
         if area > best_area:
@@ -214,6 +218,7 @@ def auto_detect_corners(req: AutoCornersRequest):
             best_quad = approx
 
     if best_quad is None:
+        # fallback: groot kader in het midden
         corners = {
             "tl": {"x": 0.08, "y": 0.08},
             "tr": {"x": 0.92, "y": 0.08},
